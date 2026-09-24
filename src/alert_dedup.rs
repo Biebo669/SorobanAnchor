@@ -129,9 +129,14 @@ impl AlertDeduplicator {
             return true;
         }
 
-        // Key not yet tracked — evict oldest if at capacity, then insert.
+        // Key not yet tracked — evict the least-recently-fired entry (minimum
+        // last_fired timestamp) if at capacity, then insert.
         if self.config.max_keys > 0 && map.len() >= self.config.max_keys {
-            if let Some(oldest_key) = map.keys().next().cloned() {
+            if let Some(oldest_key) = map
+                .iter()
+                .min_by_key(|(_, &(ts, _))| ts)
+                .map(|(k, _)| k.clone())
+            {
                 map.remove(&oldest_key);
             }
         }
@@ -394,11 +399,39 @@ mod tests {
         let d = AlertDeduplicator::new(DedupConfig { window_seconds: 9999, max_keys: 2 });
         d.should_fire("a", 1000);
         d.should_fire("b", 1001);
-        // Adding "c" should evict "a" (alphabetically first in BTreeMap)
+        // Adding "c" should evict "a" — it has the smallest last_fired timestamp.
         d.should_fire("c", 1002);
         assert_eq!(d.tracked_count(), 2);
-        // "a" was evicted; it should fire again
+        // "a" was evicted; it should fire again.
         assert!(d.should_fire("a", 1003));
+    }
+
+    /// Regression test for the lexical-order eviction bug.
+    ///
+    /// Insert keys so that alphabetical order differs from timestamp order:
+    ///   "z-alert" fired first (ts=1000), "a-alert" fired second (ts=2000).
+    /// The old `BTreeMap::keys().next()` code would evict "a-alert" (lexically
+    /// first); the fix must evict "z-alert" (oldest timestamp).
+    #[test]
+    fn eviction_uses_oldest_timestamp_not_lexical_order() {
+        let d = AlertDeduplicator::new(DedupConfig { window_seconds: 9999, max_keys: 2 });
+        // "z-alert" fires first → timestamp 1000.
+        assert!(d.should_fire("z-alert", 1000));
+        // "a-alert" fires second → timestamp 2000 (lexically first, but newer).
+        assert!(d.should_fire("a-alert", 2000));
+        // Capacity is full.  Adding a third key must evict "z-alert" (oldest ts).
+        assert!(d.should_fire("m-alert", 3000));
+        assert_eq!(d.tracked_count(), 2, "map must stay at max_keys=2");
+        // "z-alert" had the minimum timestamp → it was evicted → fires again.
+        assert!(
+            d.should_fire("z-alert", 3001),
+            "z-alert (oldest ts=1000) must have been evicted, not a-alert"
+        );
+        // "a-alert" was NOT evicted → still suppressed within its window.
+        assert!(
+            !d.should_fire("a-alert", 3001),
+            "a-alert (newer ts=2000) must still be tracked and suppressed"
+        );
     }
 
     #[test]

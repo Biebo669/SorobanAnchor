@@ -357,3 +357,100 @@ mod admin_bypass_audit_tests {
         });
     }
 }
+
+#[cfg(test)]
+mod admin_audit_log_clear_tests {
+    use soroban_sdk::testutils::{Address as _, Ledger, LedgerInfo};
+    use soroban_sdk::{Address, Env};
+    use anchorkit::admin_audit_log::{AdminAuditLog, AdminAuditLogConfig};
+    use anchorkit::contract::AnchorKitContract;
+    use anchorkit::deterministic_hash::make_storage_key;
+
+    fn make_env() -> (Env, Address) {
+        let env = Env::default();
+        env.mock_all_auths();
+        let cid = env.register_contract(None, AnchorKitContract);
+        (env, cid)
+    }
+
+    fn set_ledger(env: &Env, ts: u64) {
+        env.ledger().set(LedgerInfo {
+            timestamp: ts,
+            protocol_version: 21,
+            sequence_number: 0,
+            network_id: Default::default(),
+            base_reserve: 0,
+            min_persistent_entry_ttl: 4096,
+            min_temp_entry_ttl: 16,
+            max_entry_ttl: 6_312_000,
+        });
+    }
+
+    /// After `clear_entries`:
+    /// - old records are no longer retrievable,
+    /// - the counter resets to 0,
+    /// - a subsequent write starts at ID 0 (not the old counter value).
+    #[test]
+    fn clear_removes_stored_records_and_resets_counter() {
+        let (env, cid) = make_env();
+        set_ledger(&env, 1000);
+        let admin = Address::generate(&env);
+        env.as_contract(&cid, || {
+            // Plant the ADMIN key so the auth guard resolves.
+            env.storage()
+                .instance()
+                .set(&make_storage_key(&env, &[b"ADMIN"]), &admin);
+
+            // Write two entries.
+            AdminAuditLog::log_change(&env, &admin, "change1", "t1", "old", "new");
+            AdminAuditLog::log_change(&env, &admin, "change2", "t2", "old", "new");
+            assert_eq!(AdminAuditLog::get_entry_count(&env), 2);
+            assert!(AdminAuditLog::get_entry(&env, 0).is_some());
+            assert!(AdminAuditLog::get_entry(&env, 1).is_some());
+
+            // Clear as admin.
+            AdminAuditLog::clear_entries(&env, &admin);
+
+            // Old records must be gone.
+            assert_eq!(AdminAuditLog::get_entry_count(&env), 0,
+                "counter must be reset to 0 after clear");
+            assert!(AdminAuditLog::get_entry(&env, 0).is_none(),
+                "entry 0 must be deleted after clear");
+            assert!(AdminAuditLog::get_entry(&env, 1).is_none(),
+                "entry 1 must be deleted after clear");
+
+            // A new write must land at ID 0, not at 2.
+            AdminAuditLog::log_change(&env, &admin, "change3", "t3", "old", "new");
+            let fresh = AdminAuditLog::get_entry(&env, 0)
+                .expect("new entry must be stored at ID 0 after clear");
+            assert_eq!(
+                fresh.change_type,
+                soroban_sdk::String::from_str(&env, "change3"),
+                "new entry must carry the post-clear change type"
+            );
+            assert_eq!(AdminAuditLog::get_entry_count(&env), 1);
+        });
+    }
+
+    /// A TTL value that overflows `u32` must be rejected before any storage
+    /// write occurs; no record or truncated TTL must be written.
+    #[test]
+    #[should_panic]
+    fn oversized_ttl_is_rejected_before_storage_write() {
+        let (env, cid) = make_env();
+        set_ledger(&env, 1000);
+        let admin = Address::generate(&env);
+        env.as_contract(&cid, || {
+            // Configure a TTL that does not fit in u32.
+            let bad_config = AdminAuditLogConfig {
+                enabled: true,
+                max_entries: 10000,
+                ttl_seconds: u64::from(u32::MAX) + 1,
+            };
+            AdminAuditLog::set_config(&env, &bad_config);
+
+            // Any write attempt must panic (ValidationError) due to TTL overflow.
+            AdminAuditLog::log_change(&env, &admin, "endpoint_update", "t1", "old", "new");
+        });
+    }
+}

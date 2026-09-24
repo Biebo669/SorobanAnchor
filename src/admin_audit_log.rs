@@ -3,7 +3,9 @@
 //! This module provides audit logging for all admin configuration changes,
 //! including endpoint updates, service configuration, and other administrative operations.
 
-use soroban_sdk::{contracttype, Address, Env, String};
+use soroban_sdk::{contracttype, panic_with_error, Address, Env, String};
+use crate::deterministic_hash::make_storage_key;
+use crate::errors::ErrorCode;
 
 /// Represents a single admin configuration change event.
 #[contracttype]
@@ -174,12 +176,20 @@ impl AdminAuditLog {
             error_message,
         };
 
+        // Validate that the configured TTL fits in the u32 expected by extend_ttl.
+        // A silent truncating cast would make entries expire far earlier than
+        // configured; reject the write instead.
+        let ttl_u32: u32 = config
+            .ttl_seconds
+            .try_into()
+            .unwrap_or_else(|_| panic_with_error!(env, ErrorCode::ValidationError));
+
         // Store the event using entry_id as part of the key
         let entry_key = soroban_sdk::Symbol::new(env, "ADMIN_AUDIT");
         env.storage().instance().set(&(entry_key, entry_id), &event);
         env.storage()
             .instance()
-            .extend_ttl(config.ttl_seconds as u32, config.ttl_seconds as u32);
+            .extend_ttl(ttl_u32, ttl_u32);
 
         // Increment counter
         env.storage()
@@ -187,7 +197,7 @@ impl AdminAuditLog {
             .set(&counter_key, &(entry_id + 1));
         env.storage()
             .instance()
-            .extend_ttl(config.ttl_seconds as u32, config.ttl_seconds as u32);
+            .extend_ttl(ttl_u32, ttl_u32);
 
         // Publish event
         env.events().publish(
@@ -225,16 +235,49 @@ impl AdminAuditLog {
     pub fn set_config(env: &Env, config: &AdminAuditLogConfig) {
         let config_key = soroban_sdk::Symbol::new(env, "ADMIN_AUDIT_CFG");
         env.storage().instance().set(&config_key, config);
+        let ttl_u32: u32 = config
+            .ttl_seconds
+            .try_into()
+            .unwrap_or_else(|_| panic_with_error!(env, ErrorCode::ValidationError));
         env.storage()
             .instance()
-            .extend_ttl(config.ttl_seconds as u32, config.ttl_seconds as u32);
+            .extend_ttl(ttl_u32, ttl_u32);
     }
 
-    /// Clear all audit entries (admin only)
-    pub fn clear_entries(env: &Env) {
-        // Note: In a real implementation, this would require admin authorization
-        // and would iterate through all entries to delete them
+    /// Clear all audit entries (admin only).
+    ///
+    /// Requires the caller to be the configured admin address; panics with
+    /// [`ErrorCode::Unauthorized`] if the stored admin key is absent or the
+    /// caller is not that address.  After a successful call every previously
+    /// stored record is removed from storage and the ID counter is reset to
+    /// zero, providing a clean audit boundary.
+    pub fn clear_entries(env: &Env, caller: &Address) {
+        // Authorization: the caller must be the primary admin.
+        let admin_storage_key = make_storage_key(env, &[b"ADMIN"]);
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get::<_, Address>(&admin_storage_key)
+            .unwrap_or_else(|| panic_with_error!(env, ErrorCode::Unauthorized));
+        if *caller != admin {
+            panic_with_error!(env, ErrorCode::Unauthorized);
+        }
+        caller.require_auth();
+
+        // Delete every stored audit record up to the current counter value.
         let counter_key = soroban_sdk::Symbol::new(env, "ADMIN_AUDIT_CNT");
+        let count: u64 = env
+            .storage()
+            .instance()
+            .get(&counter_key)
+            .unwrap_or(0u64);
+
+        let entry_key = soroban_sdk::Symbol::new(env, "ADMIN_AUDIT");
+        for id in 0..count {
+            env.storage().instance().remove(&(entry_key.clone(), id));
+        }
+
+        // Reset the counter so the next write starts from ID 0.
         env.storage().instance().set(&counter_key, &0u64);
     }
 }

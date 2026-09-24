@@ -275,4 +275,47 @@ mod admin_permission_tests {
         assert!(client.has_role(&delegate_a, &AdminRole::KycAdmin));
         assert!(client.has_role(&delegate_b, &AdminRole::KycAdmin));
     }
+
+    // -----------------------------------------------------------------------
+    // Issue — clear_entries authorization guard
+    // -----------------------------------------------------------------------
+
+    /// An unauthorized caller cannot clear audit entries; the stored records
+    /// must remain intact after the rejected call.
+    #[test]
+    #[should_panic]
+    fn test_non_admin_cannot_clear_audit_entries() {
+        use anchorkit::admin_audit_log::AdminAuditLog;
+        use anchorkit::deterministic_hash::make_storage_key;
+
+        let env = Env::default(); // NO mock_all_auths — auth is enforced
+        setup_ledger(&env);
+        let contract_id = env.register_contract(None, AnchorKitContract);
+        let client = AnchorKitContractClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let non_admin = Address::generate(&env);
+
+        // Initialize with admin so the ADMIN key is present in storage.
+        env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+            address: &admin,
+            invoke: &soroban_sdk::testutils::MockAuthInvoke {
+                contract: &contract_id,
+                fn_name: "initialize",
+                args: soroban_sdk::vec![&env, admin.clone().into_val(&env)],
+                sub_invokes: &[],
+            },
+        }]);
+        client.initialize(&admin);
+
+        // Write a log entry as admin so there is something to protect.
+        env.as_contract(&contract_id, || {
+            AdminAuditLog::log_change(&env, &admin, "endpoint_update", "attestor_001", "old", "new");
+            assert_eq!(AdminAuditLog::get_entry_count(&env), 1);
+        });
+
+        // Attempt clear_entries as non_admin — must panic (Unauthorized).
+        env.as_contract(&contract_id, || {
+            AdminAuditLog::clear_entries(&env, &non_admin);
+        });
+    }
 }
